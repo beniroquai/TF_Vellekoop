@@ -1,0 +1,5 @@
+*.mat
+.dropbox
+*.DS_Store
+.idea*
+*.pyc

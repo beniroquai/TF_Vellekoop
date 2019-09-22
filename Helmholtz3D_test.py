@@ -2,12 +2,10 @@
 
 # performs a 2D simulation, assuming cylinder symmertry along Z
 
-import tensorflow as tf
+
 import numpy as np
 import matplotlib.pyplot as plt
-import h5py
 import scipy.io
-import scipy as scipy
 import Helmholtz as Helm
 import time
 
@@ -28,22 +26,27 @@ def save(filename, numpyarray):
 is_debug = False
 
 if (1):
-    mysize = (256, 128, 128)
-    myN = np.zeros(mysize)
-
-    SlabX = 260;
-    SlabW = 50;
-    SlabN = 1.52 + 0.0 * 1j;
-    Boundary=15;
+    #%% calculate the object 
+    mysize = (100, 64, 64) # z,x,y
+    dips_z, disp_x, disp_y = mysize[0]//2, mysize[1]//2, mysize[2]//2
+    Boundary = 15
+    
+    # define object parameters
+    myN = np.ones(mysize)
+    n_obj = 1.52 + 0.0 * 1j;
+    n_embb = 1.1
+    lambda_0 = 4.#.65
+    dn = np.abs(n_obj)-np.abs(n_embb)
     
     # generate Sample
-    myN = Helm.insertSphere((myN.shape[0], myN.shape[1], myN.shape[2]), obj_dim=0.1, obj_type=0, diameter=5, dn=SlabN)
-    plt.imshow(np.squeeze(np.real(myN[:,:,np.int(np.floor(mysize[2]/2))])))
+    myN = Helm.insertSphere((myN.shape[0], myN.shape[1], myN.shape[2]), obj_dim=0.1, obj_type=0, diameter=1, dn=dn, n_0 = n_embb)
 
-    k0 = 0.25 / abs(SlabN);
+    k0 = 0.25 / abs(n_obj);
     myN, _ = Helm.insertPerfectAbsorber(myN, 0, Boundary, -1, k0);
-    myN, _ = Helm.insertPerfectAbsorber(myN, myN.shape[0] - 100, Boundary, 1, k0);
+    myN, _ = Helm.insertPerfectAbsorber(myN, myN.shape[0] - Boundary, Boundary, 1, k0);
 
+    plt.imshow(np.squeeze(np.real(myN[:,:,np.int(np.floor(mysize[2]/2))]))), plt.colorbar(), plt.show()
+    
     if is_debug:
         plt.imshow(np.squeeze(np.abs(myN[:, :, :])))
         plt.show()
@@ -51,10 +54,13 @@ if (1):
         plt.show()
     save('myN', myN)
 
-    kx = 0.3
-    ky = 0
+    #%% compute the source
+    kx = 0.0 # angle in X direction
+    ky = 0. # angle in Y direction
     myWidth = 30;
-    mySrc = Helm.insertSrc(mysize, myWidth, myOff=(Boundary, 80, 0), kx=kx,ky=ky);
+    mySrc = Helm.insertSrc(mysize, myWidth, myOff=(Boundary+1, 0, 0), kx=kx,ky=ky)
+    plt.imshow(np.squeeze(np.real(mySrc[:,:,np.int(np.floor(mysize[2]/2))]))), plt.colorbar(), plt.show()
+    
     if is_debug:
         plt.imshow((np.angle(mySrc)))
         plt.show()
@@ -64,7 +70,7 @@ if (1):
 
 
 # Instantiate the Helmholtzsolver
-MyHelm = Helm.HelmholtzSolver(myN, mySrc, myeps=None, k0=k0, startPsi=None, showupdate=10)
+MyHelm = Helm.HelmholtzSolver(myN, myN0, dn, mySrc, myeps=None, lambda_0=lambda_0)
 
 # Compute the model inside the convergent born series 
 MyHelm.computeModel()
@@ -72,24 +78,27 @@ MyHelm.computeModel()
 # Initialize all operands
 MyHelm.compileGraph()
 
-#%% Do n iterations to let the series converge
-for i in range(20):
+# Compute n steps
+start_time = time.time()
+MyHelm.step(nsteps = 20)    
+print('Preparation took '+str(time.time()-start_time)+' s')
 
-    # Compute n steps
-    start_time = time.time()
-    MyHelm.step(nsteps = 100)    
-    print('Preparation took '+str(time.time()-start_time)+' s')
-    
-    # Evaluate/compute result from one step
+
+#%% Do n iterations to let the series converge
+for i in range(1):
+
+
+    #%% Evaluate/compute result from one step
     start_time = time.time()
     MyHelm.evalStep()
     print('Calculation took '+str(time.time()-start_time)+' s')
     
     # Display result 
+    EE = np.fft.fftshift(MyHelm.psi_result)
     plt.subplot(1,2,1), plt.title('Magnitude of PSI')
-    plt.imshow(np.abs(MyHelm.psi_result[:,:,64])), plt.colorbar()
+    plt.imshow(np.abs(np.squeeze(EE[:,:,disp_y]))), plt.colorbar()
     plt.subplot(1,2,2), plt.title('Phase of PSI')
-    plt.imshow(np.angle(MyHelm.psi_result[:,:,64])), plt.colorbar()
+    plt.imshow(np.angle(np.squeeze(EE[:,:,disp_y]))), plt.colorbar()
     plt.show()
     
 

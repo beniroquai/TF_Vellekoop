@@ -213,31 +213,36 @@ class HelmholtzSolver:
     % communicated by Benjamin Judkewitz
     % derived from Rainer Heintzmanns Code
     '''
-    
-    # initialize the Helmholtz operator
-    showupdate = 10
-    
-    def __init__(self, myN, mySrc, myeps=None, k0=None, startPsi=None, showupdate=10):
+        
+    def __init__(self, myN, myn_0 = 1., dn = 0.1, mySrc=None, myeps=None, lambda_0 = None):
     
         # initialize Class instance
-        self.showupdate = showupdate
+        self.myn_0 = myn_0
         self.myN = myN
+        self.dn = dn
         self.mySrc = mySrc
         self.myeps = myeps
-        self.startPsi = startPsi 
+        self.dn = np.max(self.myN )-self.myn_0
+        self.NNx, self.NNy, self.NNz  = self.myN.shape
         
         # INternal step counter 
         self.step_counter = 0
         self.nsteps = 1
         
-        if k0 == None:
-            k0=0.25/np.max(np.real(myN));
+        if lambda_0 == None:
+            self.lambda_0=0.25/np.max(np.real(myN));
         else:
-            self.k0=k0
+            self.lambda_0=lambda_0
+            
+        # specifically we choose:
+        self.n_av = (self.myn_0 + self.myn_0 + self.dn)/2   # average refractive index 
+        self.k_0 = 2*np.pi/lambda_0 * self.n_av
+        print('%.4f' % self.k_0)
         
     def computeModel(self):
         # Open a new session object 
-        # self.sess = tf.Session()   
+        # self.sess = tf.Session()  
+        
         config = tf.ConfigProto()
         jit_level = 0
         if True:
@@ -254,32 +259,54 @@ class HelmholtzSolver:
         self.sess = tf.InteractiveSession(config=config)
         
         # Start the code
-        k02 = self.k0**2;
-        kr2 = self.myN**2*k02;  # n scales with k0
-        kr2Mk02 = (kr2-k02)*1j
-        MinEps = np.max(np.abs(kr2Mk02)) + 0.001 #; % + .001
         
-        if self.myeps == None:
-            self.myeps = MinEps #; % max(abs(kr2Mk02)) + 0.001; % + .001 #% myeps = .05;
+        self.k02_max = np.max(np.abs(self.myN**2 - 1)*self.k_0**2)
+        print("%.4f" % self.k02_max)
+        self.eps = 1.001 * self.k02_max  #Eq.(11)
+
+        # Fourier space and Green's function g0(kx,kz): 
+        kkx = np.fft.fftfreq(self.NNx) * 2*np.pi
+        kky = np.fft.fftfreq(self.NNy) * 2*np.pi
+        kkz = np.fft.fftfreq(self.NNz) * 2*np.pi
         
-        # 1/(p^2-k0^2-ieps)
-        if(len(self.myN.shape)>2):
-            rr_temp = rr_freq(self.myN.shape[0], self.myN.shape[1], self.myN.shape[2])
-        else:
-            rr_temp = rr_freq(self.myN.shape[0], self.myN.shape[1], 0)
-    
-        GreensFktFourier = 1.0 / (abssqr(rr_temp) - (k02+0j)- 1j*self.myeps);
+        KKx, KKy, KKz = np.meshgrid(kkx, kky, kkz, sparse=True, indexing='ij')
+        self.g0 = 1./( np.square(KKx) + np.square(KKy) + np.square(KKz) - self.k_0**2 - 1j*self.eps)
+
+        # convolution of S with g0:
+        self.convS = np.fft.ifftn(np.fft.fftn(np.fft.ifftshift(self.mySrc)) * self.g0)
         
-        V = kr2 - k02 - 1j*self.myeps #; % V(r)
-        gamma = V * 1j / self.myeps
-           
-            
+        # scattering potential:
+        self.V = (self.myN**2 - 1) * self.k_0**2 - 1j * self.eps
+        self.V = np.fft.ifftshift(self.V)
+        
+        self.gamma = 1j/self.eps * self.V
+        
+        # Born series iteration:
+        # NOTE: DO NOT ITERATE BEYOND "CONVERGENCE" (as errors from the corners of the grid build up!)
+        # generally more iterations needed for large refractive index differences (dn)
+        
+        self.iw = 0
+        
+        
         ## Port everything to Tensorflow 
         self.tf_mySrc = tf.constant(np.squeeze(self.mySrc))
-        self.tf_GreensFktFourier = tf.constant(np.squeeze(GreensFktFourier))
-        self.tf_V = tf.constant(np.squeeze(V))
-        self.tf_gamma = tf.constant(np.squeeze(gamma))
-    
+        self.tf_g0 = tf.constant(np.squeeze(self.g0))
+        self.tf_V = tf.constant(np.squeeze(self.V))
+        self.tf_gamma = tf.constant(np.squeeze(self.gamma))
+        self.tf_convS = tf.Variable(np.squeeze(self.convS))
+        
+        # Expand dims to meet FFT requierements
+        self.tf_V = tf.expand_dims(self.tf_V, 0)
+        self.tf_convS = tf.expand_dims(self.tf_convS, 0)
+        self.tf_g0 = tf.expand_dims(self.tf_g0, 0)        
+        self.tf_gamma = tf.expand_dims(self.tf_gamma, 0)
+        
+        # initialization:
+        self.tf_psi_0 = self.tf_gamma * self.tf_convS
+        self.tf_psi = self.tf_psi_0 
+        self.tf_Upsi = self.tf_gamma * (tf.spectral.ifft3d(tf.spectral.fft3d(self.tf_psi_0*self.V)*self.tf_g0)  - self.tf_psi_0 + self.tf_convS)
+
+        '''
         if(self.myN.shape[2] !=(1)):
             # case for 3D 
             if self.startPsi == None:
@@ -295,7 +322,7 @@ class HelmholtzSolver:
                 self.tf_psi = self.startPsi
             
             self.tf_convS = my_ift2d(my_ft2d(self.tf_mySrc * self.tf_V) * self.tf_GreensFktFourier); # needs to be computed only once
-            
+        '''            
             
             
     def step(self, nsteps = 1):
@@ -304,8 +331,19 @@ class HelmholtzSolver:
         # add the steps to the internal counter
         self.nsteps = nsteps 
         print('Creating Model for '+str(self.nsteps)+' steps.')
-
+        iw = 0
+        
         for i in range(self.nsteps):
+            self.tf_convPsi = tf.spectral.ifft3d(tf.spectral.fft3d(self.tf_psi*self.tf_V)*self.tf_g0) 
+            self.tf_Upsi = self.tf_gamma * (self.tf_convPsi - self.tf_psi + self.tf_convS)
+
+            iw = iw+1  
+        
+            #self.tf_Upsi = tf.stop_gradient(self.tf_Upsi)
+            self.tf_psi = self.tf_psi + self.tf_Upsi  
+            #self.tf_psi = tf.stop_gradient(self.tf_psi)
+            '''
+            
             if(self.myN.shape[2] != (1)):
                 # case for 3D 
                 self.tf_convPsi = my_ift3d(my_ft3d(self.tf_psi * self.tf_V) * self.tf_GreensFktFourier);
@@ -313,24 +351,9 @@ class HelmholtzSolver:
                 self.tf_convPsi = my_ift2d(my_ft2d(self.tf_psi * self.tf_V) * self.tf_GreensFktFourier);
             
             self.tf_UPsi = self.tf_gamma * (self.tf_convPsi - self.tf_psi + self.tf_convS)
-            self.tf_UPsi = tf.stop_gradient(self.tf_UPsi)
+            css''' 
         
 
-            if (1): # standard way of updating
-                self.tf_psi = self.tf_psi + self.tf_UPsi
-                self.tf_psi = tf.stop_gradient(self.tf_psi)
-            else:  #% update,but also play with Epsilon
-                print("Not implemented yet")
-        #        %AbsUpdate=abs(UPsi);
-        #        %AbsUpdate(AbsUpdate<10)=10;
-        #        psi = psi + UPsi;
-        #        % Try updating epsilon
-        #        myeps = MinEps + (myeps - MinEps) /2;
-        #        GreensFktFourier = 1.0 ./ (abssqr(rr(size(myN),'freq')) - k02 - i*myeps);
-        #        V = kr2 - k02 - i*myeps; % V(r)
-        #        gamma = V .* i./myeps;       
-        #        convS = ift(ft(mySrc .* V) .* GreensFktFourier);  % needs to be computed only once
-        
     
     def compileGraph(self):
         print("Init operands ")
@@ -339,7 +362,7 @@ class HelmholtzSolver:
         self.sess.run(init_op)
         
         
-    def evalStep(self):
+    def evalStep_debug(self):
         print('Start Computing the result')
         self.step_counter += self.nsteps
         self.psi_result = self.sess.run(self.tf_psi, 
@@ -351,8 +374,14 @@ class HelmholtzSolver:
         
         print('Now performed '+str(self.step_counter)+' steps.')
 
+    def evalStep(self):
+        print('Start Computing the result')
+        self.step_counter += self.nsteps
+        self.psi_result = self.sess.run(self.tf_psi)
+        print('Now performed '+str(self.step_counter)+' steps.')
 
-def insertSphere(obj_shape = [100, 100, 100], obj_dim = 0.1, obj_type = 0, diameter = 1, dn = 0.1):
+
+def insertSphere(obj_shape = [100, 100, 100], obj_dim = 0.1, obj_type = 0, diameter = 1, dn = 0.1, n_0=1.0):
     ''' Function to generate a 3D RI distribution to give an artificial sample for testing the FWD system
     INPUTS:
         obj_shape - Nx, Ny, Nz e.g. [100, 100, 100]
@@ -370,7 +399,7 @@ def insertSphere(obj_shape = [100, 100, 100], obj_dim = 0.1, obj_type = 0, diame
             
     '''
     # one spherical object inside a volume
-    f = (dn-1)*(rr(obj_shape[0], obj_shape[1], obj_shape[2])*obj_dim < diameter)+1
+    f = (dn-1)*(rr(obj_shape[0], obj_shape[1], obj_shape[2])*obj_dim < diameter)+n_0
     return f
     
   
@@ -419,7 +448,7 @@ def insertPerfectAbsorber(myN,SlabX,SlabW=1,direction=None,k0=None,N=4):
 
     k2mk02 = np.power(alphaX,N-1)*abssqr(alpha)*(N-alphaX + 2*1j*k0*myX[myMask])/(PN*factorial(N))
     
-    if(myN.shape[2]!=2):
+    if(len(myN.shape)==2):
         # For 2D processing
         myN[myMask] = np.expand_dims(np.sqrt((k2mk02+k02)/k02), axis=1)
     else:
